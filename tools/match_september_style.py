@@ -62,7 +62,8 @@ AMOUNT_FORMAT = "#,##0.00"
 # 제목에 이 말이 들어간 열은 금액 열로 보고 우측 정렬 + #,##0.00
 _MONEY_HEADER = (
     "금액", "보험료", "납입액", "합계", "잔액", "대출", "환산",
-    "premium", "levy", "loan", "amount", "balance", "total", "fee",
+    "premium", "levy", "loan", "amount", "balance", "total", "fee", "fpd",
+    "usd", "krw", "hkd", "sgd", "jpy", "eur",
 )
 
 # 제목에 이 말이 들어간 열은 숫자여도 식별번호로 보고 가운데
@@ -145,11 +146,16 @@ def format_sheet(ws, widths: dict) -> None:
 
             cell.border = BORDER
 
-    # 열 너비: 제목 이름으로 기준값을 찾아 적용. 기준에 없는 열은 손대지 않는다.
+    # 열 너비: 제목 이름으로 기준값을 찾아 적용.
+    # 기준 파일이 폭을 지정하지 않은 열은 지정을 지워 엑셀 기본값으로 되돌린다
+    # (그래야 기준 파일과 실제로 같아진다).
     for col in range(1, ws.max_column + 1):
+        letter = get_column_letter(col)
         title = _norm(ws.cell(row=1, column=col).value)
         if title in widths:
-            ws.column_dimensions[get_column_letter(col)].width = widths[title]
+            ws.column_dimensions[letter].width = widths[title]
+        elif letter in ws.column_dimensions:
+            del ws.column_dimensions[letter]
 
     ws.page_setup.orientation = "landscape"
 
