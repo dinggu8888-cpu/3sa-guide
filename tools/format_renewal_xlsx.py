@@ -30,7 +30,7 @@ from pathlib import Path
 try:
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
+    from openpyxl.utils import column_index_from_string, get_column_letter
     from openpyxl.worksheet.properties import PageSetupProperties
 except ImportError:  # pragma: no cover
     sys.exit("openpyxl 이 필요합니다.  먼저 실행:  pip install openpyxl")
@@ -64,8 +64,18 @@ _TEXT_AMOUNT = re.compile(
 # 날짜/시간 서식 판별용
 _DATEISH = re.compile(r"(?<!\\)[ymdhs]", re.IGNORECASE)
 
-# 금액 컬럼으로 볼 제목 키워드 (--comma 옵션에서만 사용)
-_MONEY_HEADER = ("금액", "보험료", "납입액", "원금", "합계", "계", "premium", "amount", "usd", "krw")
+# 제목에 이 말이 들어간 열은 "금액 열"로 보고 열 전체를 오른쪽 정렬
+_MONEY_HEADER = (
+    "금액", "보험료", "납입액", "원금", "합계", "잔액", "대출", "환산",
+    "premium", "amount", "levy", "loan", "balance", "total", "fee",
+    "usd", "krw", "hkd", "sgd", "jpy", "eur",
+)
+
+# 제목에 이 말이 들어간 열은 숫자여도 식별번호로 보고 가운데 정렬
+_ID_HEADER = (
+    "번호", "증권", "코드", "연락처", "회차", "차년", "연령", "나이", "건수",
+    "no.", "no", "policy", "code", "id", "phone", "count", "age", "year",
+)
 
 
 def _is_dateish(cell) -> bool:
@@ -121,14 +131,65 @@ def _display_width(value) -> int:
     return widest
 
 
+def _classify_columns(ws, last_col: int, right_cols: set, center_cols: set) -> dict:
+    """열 번호 -> "right" | "center" | None(셀 단위 판정) 매핑.
+
+    1) 사용자가 --right-cols / --center-cols 로 지정한 열이 최우선
+    2) 제목이 식별번호성이면 가운데 (숫자형 증권번호가 금액으로 오인되는 것 방지)
+    3) 제목이 금액성이고 본문 과반이 숫자면 열 전체를 오른쪽 (값이 0이어도 유지)
+    """
+    result: dict[int, str | None] = {}
+    for col in range(1, last_col + 1):
+        if col in right_cols:
+            result[col] = "right"
+            continue
+        if col in center_cols:
+            result[col] = "center"
+            continue
+
+        title = str(ws.cell(row=1, column=col).value or "").strip().lower()
+        if any(k in title for k in _ID_HEADER):
+            result[col] = "center"
+            continue
+
+        if any(k in title for k in _MONEY_HEADER):
+            filled = numeric = 0
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(row=r, column=col).value
+                if v is None or v == "":
+                    continue
+                filled += 1
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    numeric += 1
+                elif isinstance(v, str) and _TEXT_AMOUNT.match(v):
+                    numeric += 1
+            if filled and numeric * 2 >= filled:
+                result[col] = "right"
+                continue
+
+        result[col] = None
+    return result
+
+
 def _merged_anchor_map(ws) -> dict:
     """병합 셀의 좌상단 좌표 집합 (병합 셀은 좌상단에만 서식을 줘도 충분)."""
     return {(rng.min_row, rng.min_col) for rng in ws.merged_cells.ranges}
 
 
-def format_sheet(ws, *, orientation: str, add_comma: bool) -> None:
+def format_sheet(
+    ws,
+    *,
+    orientation: str,
+    add_comma: bool,
+    right_cols: set | None = None,
+    center_cols: set | None = None,
+) -> None:
     if ws.max_row < 1 or ws.sheet_state != "visible":
         return
+
+    col_kind = _classify_columns(
+        ws, ws.max_column, right_cols or set(), center_cols or set()
+    )
 
     anchors = _merged_anchor_map(ws)
     merged_cells = {
@@ -138,13 +199,7 @@ def format_sheet(ws, *, orientation: str, add_comma: bool) -> None:
         for c in range(rng.min_col, rng.max_col + 1)
     } - anchors
 
-    # 금액 컬럼(제목 기준) — --comma 에서만 사용
-    money_cols = set()
-    if add_comma:
-        for cell in ws[1]:
-            title = str(cell.value or "").lower()
-            if any(k in title for k in _MONEY_HEADER):
-                money_cols.add(cell.column)
+    money_cols = {c for c, kind in col_kind.items() if kind == "right"}
 
     widths: dict[int, int] = {}
 
@@ -160,7 +215,13 @@ def format_sheet(ws, *, orientation: str, add_comma: bool) -> None:
                 cell.alignment = CENTER
             else:
                 cell.font = BODY_FONT
-                cell.alignment = RIGHT if _is_amount(cell) else CENTER
+                kind = col_kind.get(cell.column)
+                if kind == "right":
+                    cell.alignment = RIGHT
+                elif kind == "center":
+                    cell.alignment = CENTER
+                else:
+                    cell.alignment = RIGHT if _is_amount(cell) else CENTER
                 if (
                     add_comma
                     and cell.column in money_cols
@@ -176,11 +237,51 @@ def format_sheet(ws, *, orientation: str, add_comma: bool) -> None:
             if w and w > widths.get(cell.column, 0):
                 widths[cell.column] = w
 
+    # 금액 열 표시 서식 통일.
+    # 열 안에 서식이 섞여 있으면(#,##0.00 과 General 혼재) 우세한 쪽으로 맞추고,
+    # 명시 서식이 아예 없는 금액 열(예: 값이 전부 0)은 같은 시트의 다른 금액 열을 따라간다.
+    per_col_counts: dict[int, dict[str, int]] = {}
+    sheet_counts: dict[str, int] = {}
+    for col in money_cols:
+        counts: dict[str, int] = {}
+        for r in range(2, ws.max_row + 1):
+            c = ws.cell(row=r, column=col)
+            if isinstance(c.value, (int, float)) and not isinstance(c.value, bool):
+                fmt = c.number_format or "General"
+                if fmt != "General":
+                    counts[fmt] = counts.get(fmt, 0) + 1
+                    sheet_counts[fmt] = sheet_counts.get(fmt, 0) + 1
+        per_col_counts[col] = counts
+
+    sheet_dominant = max(sheet_counts, key=sheet_counts.get) if sheet_counts else None
+    for col in money_cols:
+        counts = per_col_counts[col]
+        dominant = max(counts, key=counts.get) if counts else sheet_dominant
+        if not dominant:
+            continue
+        for r in range(2, ws.max_row + 1):
+            c = ws.cell(row=r, column=col)
+            if isinstance(c.value, (int, float)) and not isinstance(c.value, bool):
+                c.number_format = dominant
+
+    # 본문에 값이 있는 열 (제목만 있는 기입용 빈 칸과 구분)
+    filled_cols = {
+        c.column
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=ws.max_column)
+        for c in row
+        if c.value not in (None, "")
+    }
+
     # 열 너비 (병합 셀 제목이 과하게 넓히는 것을 막기 위해 상한 적용)
     for col, w in widths.items():
-        ws.column_dimensions[get_column_letter(col)].width = min(
-            MAX_COL_WIDTH, max(MIN_COL_WIDTH, w + 3)
-        )
+        letter = get_column_letter(col)
+        new_width = min(MAX_COL_WIDTH, max(MIN_COL_WIDTH, w + 3))
+        if col not in filled_cols:
+            # 손으로 적는 빈 칸은 좁히지 않는다
+            current = ws.column_dimensions[letter].width
+            if current:
+                new_width = max(new_width, min(MAX_COL_WIDTH, current))
+        ws.column_dimensions[letter].width = new_width
 
     # 행 높이
     ws.row_dimensions[1].height = HEADER_ROW_HEIGHT
@@ -204,14 +305,41 @@ def format_sheet(ws, *, orientation: str, add_comma: bool) -> None:
     ws.page_margins.header = ws.page_margins.footer = 0.2
 
 
-def format_file(path: Path, *, orientation: str, add_comma: bool, backup: bool) -> str:
+def format_file(
+    path: Path,
+    *,
+    orientation: str,
+    add_comma: bool,
+    backup: bool,
+    right_cols: set | None = None,
+    center_cols: set | None = None,
+) -> str:
     wb = load_workbook(path)          # 수식 보존 (data_only=False)
     for ws in wb.worksheets:
-        format_sheet(ws, orientation=orientation, add_comma=add_comma)
+        format_sheet(
+            ws,
+            orientation=orientation,
+            add_comma=add_comma,
+            right_cols=right_cols,
+            center_cols=center_cols,
+        )
     if backup:
         shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
     wb.save(path)
     return f"{path.name}  ({len(wb.worksheets)}개 시트)"
+
+
+def _parse_cols(spec: str) -> set:
+    """ "G,I,J" 또는 "7,9,10" 을 열 번호 집합으로 변환."""
+    cols = set()
+    for token in spec.replace(" ", "").split(","):
+        if not token:
+            continue
+        if token.isdigit():
+            cols.add(int(token))
+        else:
+            cols.add(column_index_from_string(token.upper()))
+    return cols
 
 
 def main() -> int:
@@ -226,7 +354,22 @@ def main() -> int:
         default="landscape",
         help="인쇄 방향 (기본: landscape)",
     )
+    ap.add_argument(
+        "--right-cols",
+        default="",
+        help='자동 판정을 무시하고 오른쪽 정렬할 열 (예: "G,I,J")',
+    )
+    ap.add_argument(
+        "--center-cols",
+        default="",
+        help='자동 판정을 무시하고 가운데 정렬할 열 (예: "C,D")',
+    )
     args = ap.parse_args()
+
+    right_cols = _parse_cols(args.right_cols)
+    center_cols = _parse_cols(args.center_cols)
+    if right_cols & center_cols:
+        sys.exit("--right-cols 와 --center-cols 에 같은 열을 동시에 넣을 수 없습니다.")
 
     target = Path(args.folder).expanduser()
     if not target.exists():
@@ -245,7 +388,12 @@ def main() -> int:
     for f in files:
         try:
             print("  [완료]", format_file(
-                f, orientation=args.orientation, add_comma=args.comma, backup=args.backup
+                f,
+                orientation=args.orientation,
+                add_comma=args.comma,
+                backup=args.backup,
+                right_cols=right_cols,
+                center_cols=center_cols,
             ))
             ok += 1
         except Exception as exc:  # 파일 하나가 실패해도 나머지는 계속
