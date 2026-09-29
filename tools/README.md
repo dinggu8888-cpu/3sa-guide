@@ -139,3 +139,47 @@ Python 설치 없이 엑셀에서 바로 실행하는 방식입니다.
 - 일괄 실행은 **원본을 덮어씁니다.** 되돌리기가 안 되므로 첫 실행은 `--backup` 을 쓰거나 폴더를 통째로 복사해 두고 진행하세요.
 - 병합 셀이 많거나 소계 행이 섞인 시트는 자동 열 너비가 어색할 수 있습니다. 실행 후 한 번 확인하고 필요하면 해당 열만 손보시면 됩니다.
 - 결과물은 초안 기준입니다. 출력 전 육안 검수를 권장합니다.
+
+---
+
+## 근본 원인과 생성기 수정 (2026-09-29)
+
+월별 파일은 사용자 PC의 `renewal_generator.py` 가 매일 자동 생성한다.
+10월 이후 파일의 서식이 빈약했던 것은 이 스크립트의 `generate_excel()` 에
+서식 지정이 거의 없었기 때문이다. 2026.09 파일은 이 스크립트가 완성되기 전에
+만들어져서 서식이 달랐다.
+
+수정 전:
+
+```python
+header_font = Font(bold=True)               # 글꼴명 없음 → 테마 글꼴(맑은 고딕) 굵게
+cell.alignment = Alignment(horizontal="center")   # 제목행만. 배경색 없음
+# 본문 셀에는 테두리만 지정. 글꼴·정렬 지정 자체가 없음
+col_widths = [10, 12, 16, 8, 20, 20, 22, 14, 12, 10, 10, 10]
+```
+
+수정 후 (2026.09 기준 + 금액 열 우측 정렬):
+
+```python
+header_font = Font(name="Calibri Light", size=11, bold=False)
+header_fill = PatternFill("solid", fgColor="FFF8CBAD")
+body_font   = Font(name="Calibri", size=11)
+center = Alignment(horizontal="center", vertical="center")
+right  = Alignment(horizontal="right",  vertical="center")
+
+MONEY_COLS = {7, 9, 10}      # Premium + Levy · FPD · APL Loan
+
+# 본문: 금액 열은 right + '#,##0.00', 나머지는 center
+# 열 너비는 2026.09 가 지정한 열만
+col_widths = {1: 9.0, 3: 12.875, 4: 9.0, 5: 19.5,
+              7: 15.75, 8: 12.875, 9: 9.0, 12: 15.625}
+ws.page_setup.orientation = "landscape"
+```
+
+491행 중 35행 변경. 메일 수신·표 파싱·담당자/N차년 매핑·중복 방지 로직은 건드리지 않았다.
+
+검증: 수정한 `generate_excel()` 을 가상 데이터(`TEST ALPHA` 등, 실명 아님)로 직접 실행해
+2026.09 파일과 비교했다. 제목행 글꼴·배경·정렬, 본문 글꼴·정렬·테두리, 열 너비 8개,
+인쇄 방향이 모두 일치했고 금액 3열에 우측 정렬과 `#,##0.00` 이 적용됐다.
+
+> 스크립트 자체는 내부 폴더 경로와 업무용 메일 주소를 담고 있어 이 저장소에 두지 않는다.
