@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Notion__*",
+      "mcp__Gmail__get_message",
+      "mcp__Gmail__get_draft"
+    ]
+  }
+}
